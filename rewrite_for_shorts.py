@@ -140,11 +140,12 @@ def rewrite_summary_for_shorts(hook: str, summary_points: List[str], takeaway: s
     while attempt < max_retries:
         try:
             attempt += 1
+            # Note: some anthropic SDK versions don't accept 'temperature' in messages.create()
+            # Keep the request minimal to maximize compatibility.
             resp = client.messages.create(
                 model=model,
                 messages=[{"role": "user", "content": prompt}],
                 max_tokens=500,
-                temperature=0.1,
             )
 
             raw = getattr(resp, 'content', None)
