@@ -41,6 +41,13 @@ jobs:
         run: |
           python rewrite_driver.py
 
+      - name: Upload generated audio as artifact (for debugging)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: promo-out
+          path: out/**
+
 # 주의:
 # - 이 워크플로는 예시입니다. 실제 repo에선 rewrite_driver.py (또는 orchestrator) 파일을 만들어
 #   리라이팅 → 카드 생성 → TTS → 렌더/업로드를 연결하세요.
