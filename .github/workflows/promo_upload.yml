@@ -1,9 +1,8 @@
-# 예시: .github/workflows/promo_upload.yml
-name: Promo Shorts - Rewrite & Render (GitHub Actions)
+name: Promo Shorts - Daily Publish
 
 on:
   schedule:
-    - cron: '0 23 * * *'  # KST 8:00
+    - cron: "0 23 * * *" # 08:00 KST
   workflow_dispatch:
 
 jobs:
@@ -16,7 +15,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
       - name: Install system packages
         run: |
@@ -26,29 +25,75 @@ jobs:
       - name: Install Python deps
         run: |
           python -m pip install --upgrade pip
-          pip install anthropic requests pillow google-auth google-api-python-client google-auth-httplib2 google-cloud-storage
+          pip install -r requirements.txt
 
-      - name: Run promo orchestrator (rewrite only)
+      - name: Unit tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Restore promo state cache
+        uses: actions/cache@v4
+        with:
+          path: out/promo_shorts_state.json
+          key: promo-shorts-state
+          restore-keys: |
+            promo-shorts-state
+
+      - name: Publish daily Short
         env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_MODEL: ${{ secrets.OPENAI_MODEL }}
+          REWRITE_MODEL: ${{ secrets.REWRITE_MODEL }}
           ELEVENLABS_API_KEY: ${{ secrets.ELEVENLABS_API_KEY }}
           ELEVEN_VOICE_ID: ${{ secrets.ELEVEN_VOICE_ID }}
-          GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           YT_CLIENT_ID: ${{ secrets.YT_CLIENT_ID }}
           YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
           YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
-          GCS_SERVICE_ACCOUNT: ${{ secrets.GCS_SERVICE_ACCOUNT }}
-        run: |
-          python rewrite_driver.py
+          EXPECTED_YOUTUBE_CHANNEL_ID: ${{ secrets.EXPECTED_YOUTUBE_CHANNEL_ID }}
+          GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
+        run: python promo_pipeline.py --outdir out
 
-      - name: Upload generated audio as artifact (for debugging)
+      - name: Upload generated artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: promo-out
-          path: out/**
+          path: |
+            out/final.mp4
+            out/thumbnail.jpg
+            out/metadata.json
+            out/cards.json
+            out/upload.json
+            out/skipped.json
+            out/source_video.json
+            out/promo_shorts_state.json
+          if-no-files-found: warn
 
-# 주의:
-# - 이 워크플로는 예시입니다. 실제 repo에선 rewrite_driver.py (또는 orchestrator) 파일을 만들어
-#   리라이팅 → 카드 생성 → TTS → 렌더/업로드를 연결하세요.
-# - 민감한 서비스 계정 JSON은 GitHub Secrets에 반드시 "single-line" 혹은 base64로 넣어주세요.
+      - name: Fail if publish did not complete
+        if: success()
+        run: |
+          if [[ -f out/skipped.json ]]; then
+            echo "No eligible collector video today; not treating as a false-green upload."
+            exit 0
+          fi
+          if [[ ! -f out/final.mp4 ]]; then
+            echo "final.mp4 missing — render did not finish."
+            exit 1
+          fi
+          if [[ ! -f out/upload.json ]]; then
+            echo "upload.json missing — YouTube upload did not finish."
+            exit 1
+          fi
+          python - <<'PY'
+          import json, sys
+          from pathlib import Path
+          data = json.loads(Path("out/upload.json").read_text(encoding="utf-8"))
+          if data.get("skipped"):
+              print("upload skipped unexpectedly in scheduled job")
+              sys.exit(1)
+          if not data.get("youtube_id"):
+              print("upload.json has no youtube_id")
+              sys.exit(1)
+          print("uploaded", data["youtube_id"])
+          PY

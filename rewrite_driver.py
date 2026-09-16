@@ -1,28 +1,26 @@
 """
-rewrite_driver.py - 간단한 실행 드라이버
-- rewrite_for_shorts.rewrite_summary_for_shorts 사용
-- elevenlabs_tts.synthesize_to_wav 로 카드별 wav 생성
-- out/ 폴더에 결과 저장
+LOCAL DEBUG ONLY — not the GitHub Actions entrypoint.
 
-실행 예:
-  (PowerShell)
-  $env:ANTHROPIC_API_KEY = '...'
-  $env:ELEVENLABS_API_KEY = '...'
-  $env:ELEVEN_VOICE_ID = '...'
-  python rewrite_driver.py
+Production daily job:
+  python promo_pipeline.py
 
-주의: 실제 워크플로에서는 이 스크립트를 orchestrator 또는 Actions에서 호출하도록 연결하세요.
+This driver only rewrites + TTS. It does not render final.mp4 or upload.
+SAMPLE_INPUT is a leftover Canva example and is NOT the production path.
+Prefer:
+  python rewrite_driver.py --input source.json
 """
 
-import os
+from __future__ import annotations
+
+import argparse
 import json
+import os
 from pathlib import Path
-from rewrite_for_shorts import rewrite_summary_for_shorts
+
 from elevenlabs_tts import synthesize_to_wav
+from rewrite_for_shorts import rewrite_summary_for_shorts
 
-OUT_DIR = Path("out")
-OUT_DIR.mkdir(parents=True, exist_ok=True)
-
+# Deprecated leftover. Do not use this as the Actions source of truth.
 SAMPLE_INPUT = {
     "hook": "캔바로 3분 만에 유튜브 썸네일 만드는 법",
     "summary_points": [
@@ -34,36 +32,49 @@ SAMPLE_INPUT = {
 }
 
 
+def parse_args():
+    p = argparse.ArgumentParser(description="Local rewrite+TTS debug driver (not production)")
+    p.add_argument("--input", "-i", help="JSON with hook/summary_points/takeaway")
+    p.add_argument("--outdir", "-o", default="out")
+    return p.parse_args()
+
+
 def main():
+    args = parse_args()
+    out_dir = Path(args.outdir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.input:
+        payload = json.loads(Path(args.input).read_text(encoding="utf-8"))
+    else:
+        print(
+            "[driver] WARNING: SAMPLE_INPUT(Canva 예제)를 사용합니다. "
+            "프로덕션은 promo_pipeline.py + collector DB를 쓰세요. "
+            "로컬 디버그라면 --input JSON을 넘기세요."
+        )
+        payload = SAMPLE_INPUT
+
     print("[driver] 리라이팅 요청 중...")
-    cards = rewrite_summary_for_shorts(
-        SAMPLE_INPUT['hook'], SAMPLE_INPUT['summary_points'], SAMPLE_INPUT['takeaway']
-    )
-    print('[driver] 리라이팅 결과:')
+    cards = rewrite_summary_for_shorts(payload["hook"], payload["summary_points"], payload["takeaway"])
+    print("[driver] 리라이팅 결과:")
     print(json.dumps(cards, ensure_ascii=False, indent=2))
+    (out_dir / "cards.json").write_text(json.dumps(cards, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    # 각 카드 텍스트를 합쳐서 TTS 생성(또는 카드별 파일 생성)
-    # 파일 이름은 card1.wav ... card5.wav
-    voice_id = os.environ.get('ELEVEN_VOICE_ID')
-    if not voice_id:
-        raise RuntimeError('ELEVEN_VOICE_ID가 설정되어 있지 않습니다. GitHub Secrets에 추가하세요.')
+    voice_id = os.environ.get("ELEVEN_VOICE_ID")
+    api_key = os.environ.get("ELEVENLABS_API_KEY")
+    if not voice_id or not api_key:
+        print("[driver] TTS skipped (ELEVENLABS_API_KEY / ELEVEN_VOICE_ID missing).")
+        return
 
-    api_key = os.environ.get('ELEVENLABS_API_KEY')
-    if not api_key:
-        raise RuntimeError('ELEVENLABS_API_KEY가 설정되어 있지 않습니다.')
+    for key, text in cards.items():
+        out_path = out_dir / f"{key}.wav"
+        print(f"[driver] TTS 생성: {key} -> {out_path}")
+        if not synthesize_to_wav(text, voice_id=voice_id, out_path=str(out_path), api_key=api_key):
+            raise SystemExit(f"[driver] ElevenLabs TTS 실패: {key}")
+        print(f"[driver] 생성 완료: {out_path}")
 
-    for k, text in cards.items():
-        safe_name = k.replace(' ', '_')
-        out_path = OUT_DIR / f"{safe_name}.wav"
-        print(f"[driver] TTS 생성: {k} -> {out_path}")
-        ok = synthesize_to_wav(text, voice_id=voice_id, out_path=str(out_path), api_key=api_key)
-        if not ok:
-            print(f"[driver] ElevenLabs TTS 실패: {k}")
-        else:
-            print(f"[driver] 생성 완료: {out_path}")
-
-    print('[driver] 완료. out/ 폴더를 확인하세요.')
+    print("[driver] 완료. 렌더/업로드는 promo_pipeline.py를 사용하세요.")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

@@ -1,44 +1,40 @@
 """
-rewrite_for_shorts.py  - 안전한 Lv.1 리라이팅 모듈 (개선판)
-- Anthropics(claude) 기반으로 단순 리라이팅 수행
-- 재시도/타임아웃/JSON 파싱 보강, 길이 검증 포함
+rewrite_for_shorts.py — 쇼츠 카드뉴스용 리라이팅 (OpenAI)
 
-사용법 예시:
-  from rewrite_for_shorts import rewrite_summary_for_shorts
+사용법:
+  from rewrite_for_shorts import rewrite_summary_for_shorts, cards_as_list
   cards = rewrite_summary_for_shorts(hook, summary_points, takeaway)
 
-필요한 환경변수:
-  ANTHROPIC_API_KEY
+환경변수:
+  OPENAI_API_KEY   (필수 — 키가 없고 입력 카드도 쓸 수 없으면 실패)
+  OPENAI_MODEL     (선택, 기본 gpt-4.1-mini)
+  REWRITE_MODEL    (선택, OPENAI_MODEL보다 우선. claude-* 값은 무시)
 
-주의: 이 파일은 "리라이팅"만 담당합니다. 카드 렌더/tts/비디오 합성은 별도 파이프라인에서 처리하세요.
+폴백: OpenAI 호출이 실패한 뒤에만, 그리고 원본 hook/summary_points/takeaway가
+이미 카드로 쓸 수 있을 때만 규칙 기반 축약을 사용한다.
+하드코딩된 Canva 샘플을 프로덕션에서 쓰지 않는다.
 """
 
-import os
-import time
-import re
+from __future__ import annotations
+
 import json
-from typing import List, Dict, Optional
+import os
+import re
+import time
+from typing import Dict, List, Optional
 
-# Anthropics는 사용 환경에 맞게 설치/불러오기
-# pip install anthropic
-try:
-    import anthropic
-except Exception:
-    anthropic = None
+CARD_KEYS = ["card1_hook", "card2", "card3", "card4", "card5_takeaway"]
 
-REWRITE_MODEL = os.environ.get("REWRITE_MODEL", "claude-haiku-4-5-20251001")
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
-
-# 동작 파라미터
+DEFAULT_OPENAI_MODEL = "gpt-4.1-mini"
 MAX_RETRIES = 3
-RETRY_BACKOFF = 2.0  # 지수 백오프 계수
+RETRY_BACKOFF = 2.0
 MIN_CHARS = 10
-MAX_CHARS = 35  # 카드당 최대 권장 길이(한글 기준 권장값)
+MAX_CHARS = 35  # 카드당 권장 길이(한글)
+VALIDATE_MAX_CHARS = MAX_CHARS + 20  # 검증 여유
 
-# 금지 문자/패턴 (간단 검증)
-DISALLOWED_PATTERNS = [r"[#@\u200b]", r"https?://"]  # 해시태그/링크/제로폭문자 등
+DISALLOWED_PATTERNS = [r"[#@\u200b]", r"https?://"]
 
-PROMPT_TEMPLATE = r'''
+PROMPT_TEMPLATE = r"""
 다음은 유튜브 영상 하나를 AI가 요약한 내용입니다.
 의미와 핵심 정보는 그대로 유지하되, 원문과 문장 구조·단어 선택이
 겹치지 않도록 표현을 완전히 바꿔서 쇼츠 카드뉴스용 문구로 재작성해주세요.
@@ -63,189 +59,200 @@ PROMPT_TEMPLATE = r'''
 
 [원본 takeaway]
 {takeaway}
-'''
-
-
-def _clean_model_text(text: str) -> str:
-    """모델 반환에서 JSON 블록만 안전하게 추출하려고 시도.
-    - 코드블록 ```json ``` 제거
-    - 가장 큰 중괄호 블록을 찾아 반환
-    """
-    if not text:
-        return ""
-
-    # 제거: ```json ... ``` 및 ``` ... ```
-    text = re.sub(r"^```json\s*", "", text, flags=re.IGNORECASE)
-    text = re.sub(r"^```\s*", "", text)
-    text = re.sub(r"```\s*$", "", text)
-
-    # 가장 바깥 중괄호 블록 추출(가장 첫 '{' 와 마지막 '}' 사용)
-    start = text.find("{")
-    end = text.rfind("}")
-    if start != -1 and end != -1 and end > start:
-        return text[start:end+1].strip()
-
-    # fallback: 기존 방식(가장 첫 매칭)
-    match = re.search(r"(\{.*\})", text, flags=re.DOTALL)
-    if match:
-        return match.group(1).strip()
-
-    # 그냥 전체 반환 (fallback)
-    return text.strip()
-
-
-def _validate_card_text(s: str) -> bool:
-    if not s:
-        return False
-    # 길이(문자기준)
-    l = len(s)
-    if l < MIN_CHARS or l > (MAX_CHARS + 20):  # 여유 허용
-        return False
-    # 금지 패턴 존재 검사
-    for p in DISALLOWED_PATTERNS:
-        if re.search(p, s):
-            return False
-    return True
+"""
 
 
 class RewriteError(Exception):
     pass
 
 
-def _simple_rewrite_fallback(hook: str, summary_points: List[str], takeaway: str) -> Dict[str, str]:
-    """
-    Anthropic 호출이 불가능할 때 사용하는 간단한 규칙 기반 폴백 리라이팅.
-    - 길이 제한 적용(권장 15~30자 범위로 트리밍)
-    - 최소한의 표현 변경(불필요 공백 제거, 문장 끝 마침표 제거, 일부 트리밍)
-    """
-    def normalize(s: str, max_len: int = 28) -> str:
-        s = s.strip()
-        s = re.sub(r"\s+", " ", s)
-        # 문장 끝의 마침표/물음표/느낌표 제거
-        s = re.sub(r"[。.!?]+$", "", s)
-        if len(s) > max_len:
-            # 자연스러운 잘림을 위해 마지막 공백 기준으로 자름
-            cut = s[:max_len].rfind(" ")
-            if cut > max_len // 2:
-                s = s[:cut]
-            else:
-                s = s[:max_len]
-            s = s.rstrip(" ,;:")
-            s += "…"
+def resolve_rewrite_model(explicit: Optional[str] = None) -> str:
+    if explicit:
+        return explicit
+    raw = (os.environ.get("REWRITE_MODEL") or os.environ.get("OPENAI_MODEL") or "").strip()
+    if not raw or raw.lower().startswith("claude"):
+        return DEFAULT_OPENAI_MODEL
+    return raw
+
+
+def cards_as_list(data: Dict[str, str]) -> List[str]:
+    return [str(data[k]).strip() for k in CARD_KEYS]
+
+
+def clean_model_text(text: str) -> str:
+    """모델 반환에서 JSON 객체만 추출."""
+    if not text:
+        return ""
+
+    text = re.sub(r"^```json\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"^```\s*", "", text)
+    text = re.sub(r"```\s*$", "", text)
+
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        return text[start : end + 1].strip()
+
+    match = re.search(r"(\{.*\})", text, flags=re.DOTALL)
+    if match:
+        return match.group(1).strip()
+    return text.strip()
+
+
+def normalize_card_text(s: str) -> str:
+    s = (s or "").strip()
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+
+def validate_card_text(s: str) -> bool:
+    if not s:
+        return False
+    if len(s) < MIN_CHARS or len(s) > VALIDATE_MAX_CHARS:
+        return False
+    for p in DISALLOWED_PATTERNS:
+        if re.search(p, s):
+            return False
+    return True
+
+
+def parse_cards_json(raw_text: str) -> Dict[str, str]:
+    cleaned = clean_model_text(raw_text)
+    try:
+        data = json.loads(cleaned)
+    except json.JSONDecodeError as exc:
+        raise RewriteError(f"카드 JSON 파싱 실패: {exc}") from exc
+
+    if not isinstance(data, dict):
+        raise RewriteError("카드 JSON이 객체가 아닙니다.")
+    if not all(k in data for k in CARD_KEYS):
+        raise RewriteError(f"모델 응답에 예상 키가 없습니다: {list(data.keys())}")
+
+    out: Dict[str, str] = {}
+    for k in CARD_KEYS:
+        v = normalize_card_text(str(data[k]))
+        if not validate_card_text(v):
+            raise RewriteError(f"카드 텍스트가 유효하지 않습니다: {k} -> '{v[:40]}' (len={len(v)})")
+        out[k] = v
+    return out
+
+
+def _trim_to_len(s: str, max_len: int) -> str:
+    s = normalize_card_text(s)
+    s = re.sub(r"[。.!?]+$", "", s)
+    if len(s) <= max_len:
         return s
+    cut = s[:max_len].rfind(" ")
+    if cut > max_len // 2:
+        s = s[:cut]
+    else:
+        s = s[:max_len]
+    return s.rstrip(" ,;:") + "…"
 
-    card1 = normalize(hook, max_len=30)
-    card2 = normalize(summary_points[0], max_len=28)
-    card3 = normalize(summary_points[1], max_len=28)
-    card4 = normalize(summary_points[2], max_len=28)
-    card5 = normalize(takeaway, max_len=34)
 
+def simple_rewrite_fallback(hook: str, summary_points: List[str], takeaway: str) -> Dict[str, str]:
+    """원본을 길이만 맞춰 카드화. 샘플 문구를 넣지 않는다."""
+    if len(summary_points) < 3:
+        raise RewriteError("summary_points는 최소 3개 필요합니다.")
     return {
-        "card1_hook": card1,
-        "card2": card2,
-        "card3": card3,
-        "card4": card4,
-        "card5_takeaway": card5,
+        "card1_hook": _trim_to_len(hook, 30),
+        "card2": _trim_to_len(summary_points[0], 28),
+        "card3": _trim_to_len(summary_points[1], 28),
+        "card4": _trim_to_len(summary_points[2], 28),
+        "card5_takeaway": _trim_to_len(takeaway, 34),
     }
 
 
-def rewrite_summary_for_shorts(hook: str, summary_points: List[str], takeaway: str,
-                               model: Optional[str] = None,
-                               max_retries: int = MAX_RETRIES) -> Dict[str, str]:
-    """
-    Anthropic 호출을 시도하되, 결제/서비스 오류 등으로 실패하면 간단한 폴백을 사용.
-    """
-    if anthropic is None:
-        # SDK가 없으면 폴백
-        return _simple_rewrite_fallback(hook, summary_points, takeaway)
+def source_has_usable_cards(hook: str, summary_points: List[str], takeaway: str) -> bool:
+    try:
+        cards = simple_rewrite_fallback(hook, summary_points, takeaway)
+        return all(validate_card_text(cards[k]) for k in CARD_KEYS)
+    except Exception:
+        return False
 
-    if not ANTHROPIC_API_KEY:
-        # 키가 없으면 폴백
-        return _simple_rewrite_fallback(hook, summary_points, takeaway)
 
-    if len(summary_points) < 3:
+def _openai_complete(prompt: str, model: str) -> str:
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        raise RewriteError("OPENAI_API_KEY가 설정되어 있지 않습니다.")
+
+    try:
+        from openai import OpenAI
+    except ImportError as exc:
+        raise RewriteError("openai 패키지가 필요합니다. pip install openai") from exc
+
+    client = OpenAI(api_key=api_key)
+    kwargs = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": 800,
+        "temperature": 0.6,
+    }
+    try:
+        resp = client.chat.completions.create(response_format={"type": "json_object"}, **kwargs)
+    except Exception:
+        resp = client.chat.completions.create(**kwargs)
+
+    content = resp.choices[0].message.content if resp.choices else ""
+    if not content:
+        raise RewriteError("OpenAI 응답이 비어 있습니다.")
+    return content
+
+
+def rewrite_summary_for_shorts(
+    hook: str,
+    summary_points: List[str],
+    takeaway: str,
+    model: Optional[str] = None,
+    max_retries: int = MAX_RETRIES,
+) -> Dict[str, str]:
+    """
+    OpenAI로 5장 카드를 만든다.
+    OpenAI가 실패하고 원본이 이미 카드로 쓸 수 있으면 축약 폴백만 사용한다.
+    """
+    points = [str(p).strip() for p in (summary_points or []) if str(p).strip()]
+    if len(points) < 3:
         raise RewriteError("summary_points는 최소 3개 필요합니다.")
-
-    model = model or REWRITE_MODEL
 
     prompt = PROMPT_TEMPLATE.format(
         min_chars=MIN_CHARS,
         max_chars=MAX_CHARS,
         hook=hook,
-        p1=summary_points[0],
-        p2=summary_points[1],
-        p3=summary_points[2],
+        p1=points[0],
+        p2=points[1],
+        p3=points[2],
         takeaway=takeaway,
     )
+    chosen = resolve_rewrite_model(model)
+    last_exc: Optional[Exception] = None
 
-    client = anthropic.Client(api_key=ANTHROPIC_API_KEY)
+    if not os.environ.get("OPENAI_API_KEY"):
+        last_exc = RewriteError("OPENAI_API_KEY가 설정되어 있지 않습니다.")
+        if source_has_usable_cards(hook, points, takeaway):
+            print(f"[rewrite] OpenAI 키 없음, 원본 카드 폴백 사용")
+            return simple_rewrite_fallback(hook, points, takeaway)
+        raise last_exc
 
-    attempt = 0
-    last_exc = None
-    while attempt < max_retries:
+    for attempt in range(1, max_retries + 1):
         try:
-            attempt += 1
-            # Anthropic SDK 호환성 고려: 불필요 파라미터 제거
-            resp = client.messages.create(
-                model=model,
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=500,
-            )
+            raw = _openai_complete(prompt, chosen)
+            return parse_cards_json(raw)
+        except Exception as exc:
+            last_exc = exc
+            if attempt < max_retries:
+                time.sleep(RETRY_BACKOFF**attempt)
 
-            raw = getattr(resp, "content", None)
-            if raw and isinstance(raw, list) and len(raw) > 0:
-                raw_text = raw[0].text
-            else:
-                raw_text = str(resp)
+    if source_has_usable_cards(hook, points, takeaway):
+        print(f"[rewrite] OpenAI 실패, 원본 카드 폴백 사용 (last_exc={last_exc})")
+        return simple_rewrite_fallback(hook, points, takeaway)
 
-            cleaned = _clean_model_text(raw_text)
-
-            # JSON 로드 (안전한 방식)
-            try:
-                data = json.loads(cleaned)
-            except Exception:
-                start = raw_text.find("{")
-                end = raw_text.rfind("}")
-                if start != -1 and end != -1 and end > start:
-                    data = json.loads(raw_text[start:end+1])
-                else:
-                    raise
-
-            # 필수 키 검증
-            expected_keys = ["card1_hook", "card2", "card3", "card4", "card5_takeaway"]
-            if not all(k in data for k in expected_keys):
-                raise RewriteError(f"모델 응답에 예상 키가 없습니다: {list(data.keys())}")
-
-            # 각 카드 검증 및 길이 조정/후처리
-            for k in expected_keys:
-                v = data[k].strip()
-                v = re.sub(r"\s+", " ", v)
-                data[k] = v
-                if not _validate_card_text(v):
-                    raise RewriteError(f"카드 텍스트가 유효하지 않습니다: {k} -> '{v[:40]}' (len={len(v)})")
-
-            return data
-
-        except Exception as e:
-            last_exc = e
-            msg = str(e).lower()
-            # 잔액/결제 관련 에러면 즉시 폴백 사용
-            if "credit" in msg or "balance" in msg or "payment" in msg or "insufficient" in msg:
-                print("[rewrite] Anthropic 호출 실패(잔액/결제): 폴백 리라이팅 사용")
-                return _simple_rewrite_fallback(hook, summary_points, takeaway)
-
-            # 일시적 네트워크/SDK 오류는 재시도
-            wait = RETRY_BACKOFF ** attempt
-            time.sleep(wait)
-            continue
-
-    # 모든 재시도 실패하면 폴백을 사용
-    print("[rewrite] 모든 재시도 실패: 폴백 리라이팅 사용 (last_exc=", last_exc, ")")
-    return _simple_rewrite_fallback(hook, summary_points, takeaway)
+    raise RewriteError(
+        "OpenAI 리라이팅에 실패했고 원본 hook/summary_points/takeaway도 "
+        f"카드로 쓸 수 없습니다: {last_exc}"
+    )
 
 
 if __name__ == "__main__":
-    # 간단 로컬 테스트
     sample = rewrite_summary_for_shorts(
         hook="캔바로 3분 만에 유튜브 썸네일 만드는 법",
         summary_points=[
