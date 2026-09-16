@@ -1,0 +1,11 @@
+out/
+.venv/
+__pycache__/
+*.pyc
+.env
+.env.*
+client_secret*.json
+token.json
+*.mp4
+*.wav
+.promo_shorts_state.json
