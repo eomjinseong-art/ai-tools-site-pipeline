@@ -52,8 +52,12 @@ def check_command(name: str) -> None:
 
 
 def run(cmd: List[str], check: bool = True) -> None:
+    if cmd and cmd[0] in {"ffmpeg", "ffprobe"} and "-loglevel" not in cmd:
+        cmd = [cmd[0], "-hide_banner", "-loglevel", "error", *cmd[1:]]
     logging.debug("RUN: %s", " ".join(cmd))
-    subprocess.run(cmd, check=check)
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if check and result.returncode != 0:
+        raise RuntimeError(f"Command failed ({result.returncode}): {' '.join(cmd)}\n{result.stderr or result.stdout}")
 
 
 def ffprobe_duration(path: str) -> float:
