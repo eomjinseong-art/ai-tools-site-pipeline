@@ -1,5 +1,5 @@
 """
-Full orchestrator: rewrite -> card images -> ElevenLabs TTS -> clips -> final.mp4
+Full orchestrator: cards -> card images -> edge-tts/gTTS -> clips -> final.mp4
 
 Usage:
   python full_orchestrator.py --outdir out --input metadata.json
@@ -26,12 +26,6 @@ try:
 except Exception as exc:
     rewrite_for_shorts = None
     logging.warning("rewrite_for_shorts not importable: %s", exc)
-
-try:
-    import elevenlabs_tts
-except Exception as exc:
-    elevenlabs_tts = None
-    logging.warning("elevenlabs_tts not importable: %s", exc)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
@@ -286,16 +280,13 @@ def _cards_from_metadata(metadata: Optional[Dict]) -> List[str]:
 
 
 def synthesize_card_audio(text: str, audio_path: str, allow_silent_tts: bool) -> None:
-    voice_id = os.environ.get("ELEVEN_VOICE_ID")
-    api_key = os.environ.get("ELEVENLABS_API_KEY")
-    if elevenlabs_tts is None or not voice_id or not api_key:
-        if allow_silent_tts:
-            run(["ffmpeg", "-y", "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=22050", "-t", "1.0", audio_path])
-            return
-        raise RuntimeError("ELEVENLABS_API_KEY와 ELEVEN_VOICE_ID가 필요합니다.")
-    ok = elevenlabs_tts.synthesize_to_wav(text, voice_id=voice_id, out_path=audio_path, api_key=api_key)
-    if not ok:
-        raise RuntimeError(f"ElevenLabs TTS 실패: {audio_path}")
+    if allow_silent_tts:
+        run(["ffmpeg", "-y", "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=22050", "-t", "1.0", audio_path])
+        return
+    from tts import synthesize_speech
+
+    engine = synthesize_speech(text, audio_path)
+    logging.info("TTS engine=%s file=%s", engine, audio_path)
 
 
 def orchestrate(
@@ -319,11 +310,23 @@ def orchestrate(
     if not cards:
         if rewrite_for_shorts is None:
             raise RuntimeError("No cards provided and rewrite_for_shorts module not available.")
-        hook = (metadata.get("hook") if metadata else "") or ""
-        summary_points = (metadata.get("summary_points") if metadata else []) or []
-        takeaway = (metadata.get("takeaway") if metadata else "") or ""
-        logging.info("Calling rewrite_for_shorts.rewrite_summary_for_shorts()")
-        cards_struct = rewrite_for_shorts.rewrite_summary_for_shorts(hook, summary_points, takeaway)
+        meta = metadata or {}
+        hook = meta.get("hook") or ""
+        summary_points = meta.get("summary_points") or []
+        takeaway = meta.get("takeaway") or ""
+        logging.info("Resolving shorts script from the content queue or template")
+        cards_struct = rewrite_for_shorts.rewrite_summary_for_shorts(
+            hook,
+            summary_points,
+            takeaway,
+            title=meta.get("title") or "",
+            tool_name=meta.get("tool_name") or meta.get("name") or "",
+            one_line=meta.get("one_line") or meta.get("description") or "",
+            features=meta.get("key_features") or meta.get("features"),
+            link=meta.get("link") or meta.get("url") or "",
+            youtube_id=meta.get("youtube_id") or "",
+            tool_id=str(meta.get("id") or ""),
+        )
         if isinstance(cards_struct, dict):
             cards = rewrite_for_shorts.cards_as_list(cards_struct)
             short_title = short_title or cards_struct.get("card1_hook")

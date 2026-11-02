@@ -1,5 +1,4 @@
--- One-time migration for the collector Supabase project
--- (sibling repo: eomjinseong-art/C-ai-tools-collector).
+-- One-time migration for the collector Supabase project.
 -- Run in the Supabase SQL editor. Safe to re-run.
 --
 -- These columns record that a published video was already turned

@@ -1,35 +1,118 @@
 import json
+import os
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import mock
 
 import promo_pipeline
+from content_queue import CONSUMED_PATH
 from full_orchestrator import wrap_text_for_image
-from PIL import ImageDraw, ImageFont, Image
+from PIL import Image, ImageDraw, ImageFont
+from youtube_upload import YouTubeAuthExpired
+
+
+ROOT = Path(__file__).resolve().parents[1]
+FIXTURE = Path(__file__).parent / "fixtures" / "sample_video.json"
+QUIET_GITHUB = {"GITHUB_ACTIONS": "", "GITHUB_TOKEN": "", "GH_TOKEN": ""}
 
 
 class PipelineTests(unittest.TestCase):
-    def test_dry_run_writes_cards_not_upload(self):
-        fixture = Path(__file__).parent / "fixtures" / "sample_video.json"
-        cards = {
-            "card1_hook": "반복 업무를 바로 맡기는 방법",
-            "card2": "이메일 초안은 먼저 맡기세요",
-            "card3": "표와 요약은 템플릿으로 고정",
-            "card4": "결과는 사람이 한 번 검수하세요",
-            "card5_takeaway": "템플릿만 있으면 시간을 줄입니다",
-        }
+    def test_dry_run_uses_queue_and_does_not_consume(self):
+        before = CONSUMED_PATH.read_text(encoding="utf-8")
         with TemporaryDirectory() as tmp:
-            with mock.patch("promo_pipeline.rewrite_summary_for_shorts", return_value=cards):
-                rc = promo_pipeline.main(["--input", str(fixture), "--outdir", tmp, "--dry-run"])
+            with mock.patch.dict(os.environ, QUIET_GITHUB, clear=False):
+                rc = promo_pipeline.main(["--input", str(FIXTURE), "--outdir", tmp, "--dry-run"])
             self.assertEqual(rc, 0)
             out = Path(tmp)
-            self.assertTrue((out / "cards.json").is_file())
-            self.assertTrue((out / "metadata.json").is_file())
+            cards = json.loads((out / "cards.json").read_text(encoding="utf-8"))
+            meta = json.loads((out / "metadata.json").read_text(encoding="utf-8"))
+            status = json.loads((out / "queue_status.json").read_text(encoding="utf-8"))
+            self.assertTrue(meta["dry_run"])
+            self.assertEqual(meta["script_source"], "queue")
+            self.assertEqual(meta["script_id"], "chatgpt-handoff")
+            self.assertIn("챗GPT", cards["card1_hook"])
+            self.assertIn("days_left", status)
             self.assertFalse((out / "final.mp4").exists())
             self.assertFalse((out / "upload.json").exists())
-            meta = json.loads((out / "metadata.json").read_text(encoding="utf-8"))
-            self.assertTrue(meta["dry_run"])
+        self.assertEqual(CONSUMED_PATH.read_text(encoding="utf-8"), before)
+
+    def test_skip_rewrite_uses_template(self):
+        with TemporaryDirectory() as tmp:
+            with mock.patch.dict(os.environ, QUIET_GITHUB, clear=False):
+                rc = promo_pipeline.main(
+                    ["--input", str(FIXTURE), "--outdir", tmp, "--dry-run", "--skip-rewrite"]
+                )
+            self.assertEqual(rc, 0)
+            meta = json.loads((Path(tmp) / "metadata.json").read_text(encoding="utf-8"))
+            cards = json.loads((Path(tmp) / "cards.json").read_text(encoding="utf-8"))
+        self.assertEqual(meta["script_source"], "template")
+        self.assertIsNone(meta["script_id"])
+        blob = " ".join(cards.values())
+        self.assertIn("챗GPT", blob)
+        self.assertNotIn("http", blob)
+
+    def test_invalid_grant_opens_issue_and_fails(self):
+        with TemporaryDirectory() as tmp:
+            final = Path(tmp) / "final.mp4"
+            final.write_bytes(b"x" * 32)
+            with mock.patch.dict(os.environ, QUIET_GITHUB, clear=False):
+                with mock.patch(
+                    "promo_pipeline.render_final",
+                    return_value={"final_path": str(final), "thumbnail": None},
+                ):
+                    with mock.patch(
+                        "promo_pipeline.upload_shorts",
+                        side_effect=YouTubeAuthExpired("invalid_grant"),
+                    ):
+                        with mock.patch(
+                            "promo_pipeline.open_youtube_reauth_issue",
+                            return_value={"action": "created", "number": 9},
+                        ) as notify:
+                            rc = promo_pipeline.main(["--input", str(FIXTURE), "--outdir", tmp])
+            self.assertEqual(rc, 1)
+            notify.assert_called_once()
+            self.assertFalse((Path(tmp) / "upload.json").exists())
+            error = json.loads((Path(tmp) / "youtube_auth_error.json").read_text(encoding="utf-8"))
+            self.assertEqual(error["error"], "invalid_grant")
+            self.assertEqual(error["issue"]["number"], 9)
+        self.assertEqual(json.loads(CONSUMED_PATH.read_text(encoding="utf-8"))["consumed_ids"], [])
+
+    def test_successful_upload_consumes_script_outside_the_repo_file_when_overridden(self):
+        with TemporaryDirectory() as tmp:
+            final = Path(tmp) / "final.mp4"
+            final.write_bytes(b"x" * 32)
+            consumed = Path(tmp) / "consumed.json"
+            captured = {}
+
+            def fake_upload(video_path, title, description, thumbnail_path=None, **kwargs):
+                captured["description"] = description
+                captured["title"] = title
+                return "yt123"
+
+            env = dict(QUIET_GITHUB)
+            env["CONTENT_QUEUE_CONSUMED_PATH"] = str(consumed)
+            with mock.patch.dict(os.environ, env, clear=False):
+                with mock.patch(
+                    "promo_pipeline.render_final",
+                    return_value={"final_path": str(final), "thumbnail": None},
+                ):
+                    with mock.patch("promo_pipeline.upload_shorts", side_effect=fake_upload):
+                        with mock.patch(
+                            "promo_pipeline.SupabaseSource.mark_uploaded",
+                            return_value={"db_updated": False},
+                        ):
+                            rc = promo_pipeline.main(["--input", str(FIXTURE), "--outdir", tmp])
+            self.assertEqual(rc, 0)
+            upload = json.loads((Path(tmp) / "upload.json").read_text(encoding="utf-8"))
+            self.assertEqual(upload["youtube_id"], "yt123")
+            self.assertEqual(upload["script_id"], "chatgpt-handoff")
+            self.assertIn("https://chatgpt.com", captured["description"])
+            self.assertIn("https://www.youtube.com/watch?v=dQw4w9wg", captured["description"])
+            self.assertEqual(json.loads(consumed.read_text(encoding="utf-8"))["consumed_ids"], ["chatgpt-handoff"])
+            runtime = json.loads((Path(tmp) / "content_queue_state.json").read_text(encoding="utf-8"))
+            self.assertEqual(runtime["consumed_ids"], ["chatgpt-handoff"])
+        self.assertEqual(json.loads(CONSUMED_PATH.read_text(encoding="utf-8"))["consumed_ids"], [])
 
     def test_korean_wrap_splits_without_spaces(self):
         img = Image.new("RGB", (200, 200), "white")
@@ -38,12 +121,46 @@ class PipelineTests(unittest.TestCase):
         lines = wrap_text_for_image("가나다라마바사아자차카타파하", font, max_width=20, draw=draw)
         self.assertGreater(len(lines), 1)
 
-    def test_workflow_calls_real_entrypoint(self):
-        workflow = Path(__file__).resolve().parents[1] / ".github" / "workflows" / "promo_upload.yml"
-        text = workflow.read_text(encoding="utf-8")
-        self.assertIn("promo_pipeline.py", text)
-        self.assertNotIn("rewrite_driver.py", text)
-        self.assertNotIn("rewrite only", text)
+    def test_workflow_has_no_paid_ai_secrets(self):
+        workflow = (ROOT / ".github" / "workflows" / "promo_upload.yml").read_text(encoding="utf-8")
+        self.assertIn("promo_pipeline.py", workflow)
+        self.assertNotIn("rewrite_driver.py", workflow)
+        self.assertNotIn("OPENAI_API_KEY", workflow)
+        self.assertNotIn("ELEVENLABS_API_KEY", workflow)
+        self.assertNotIn("ELEVEN_VOICE_ID", workflow)
+        self.assertNotIn("openai", workflow.lower())
+        self.assertNotIn("eleven", workflow.lower())
+        self.assertIn("issues: write", workflow)
+        self.assertIn("GITHUB_TOKEN", workflow)
+        self.assertIn("ko-KR-SunHiNeural", workflow)
+        self.assertIn("유튜브 로그인 다시 필요", workflow)
+        self.assertIn("쇼츠 대본 대기열 부족", workflow)
+        self.assertFalse((ROOT / "elevenlabs_tts.py").exists())
+
+    def test_sources_omit_personal_names_and_paid_sdks(self):
+        forbidden_names = ("진" + "성", "로" + "빈", "엄" + "진" + "성")
+        forbidden_sdks = ("openai", "elevenlabs", "eleven_api", "eleven_voice")
+        roots = [ROOT]
+        checked = 0
+        for path in ROOT.rglob("*"):
+            if not path.is_file():
+                continue
+            if ".git" in path.parts or "__pycache__" in path.parts or path.suffix == ".pyc":
+                continue
+            if path.suffix.lower() not in {".py", ".yml", ".yaml", ".md", ".txt", ".json", ".sql", ".ps1"}:
+                continue
+            text = path.read_text(encoding="utf-8")
+            checked += 1
+            for name in forbidden_names:
+                self.assertNotIn(name, text, f"{name} in {path}")
+            if "tests" in path.parts:
+                continue
+            if path.suffix.lower() in {".py", ".yml", ".yaml", ".txt"}:
+                lowered = text.lower()
+                for sdk in forbidden_sdks:
+                    self.assertNotIn(sdk, lowered, f"{sdk} in {path}")
+        self.assertGreater(checked, 10)
+        del roots
 
 
 if __name__ == "__main__":
