@@ -32,6 +32,43 @@ class YouTubeUploadError(Exception):
     pass
 
 
+class YouTubeAuthExpired(YouTubeUploadError):
+    """OAuth refresh token이 invalid_grant 로 거절된 경우."""
+
+
+def is_invalid_grant(exc: BaseException) -> bool:
+    seen: set[int] = set()
+    current: Optional[BaseException] = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if _payload_has_invalid_grant(current):
+            return True
+        cause = current.__cause__
+        context = current.__context__ if not current.__suppress_context__ else None
+        current = cause or context
+    return False
+
+
+def _payload_has_invalid_grant(exc: BaseException) -> bool:
+    if "invalid_grant" in str(exc).lower():
+        return True
+    for arg in getattr(exc, "args", ()):
+        if isinstance(arg, str) and "invalid_grant" in arg.lower():
+            return True
+        if isinstance(arg, dict):
+            error = str(arg.get("error") or "").lower()
+            description = str(arg.get("error_description") or "").lower()
+            if error == "invalid_grant" or "invalid_grant" in error or "invalid_grant" in description:
+                return True
+    return False
+
+
+_AUTH_EXPIRED_MESSAGE = (
+    "YouTube OAuth refresh failed with invalid_grant. "
+    "YT_REFRESH_TOKEN 을 다시 발급해야 합니다."
+)
+
+
 def build_shorts_title(source_title: str, hook: Optional[str] = None) -> str:
     base = (hook or source_title or "나두 AI 요약").strip()
     base = " ".join(base.split())
@@ -83,7 +120,14 @@ def credentials_from_env(env: Optional[Dict[str, str]] = None) -> Credentials:
 
 
 def refresh_access_token(creds: Credentials) -> Credentials:
-    creds.refresh(Request())
+    try:
+        creds.refresh(Request())
+    except YouTubeAuthExpired:
+        raise
+    except Exception as exc:
+        if is_invalid_grant(exc):
+            raise YouTubeAuthExpired(_AUTH_EXPIRED_MESSAGE) from exc
+        raise YouTubeUploadError(f"YouTube 액세스 토큰 갱신 실패: {exc}") from exc
     if not creds.valid:
         raise YouTubeUploadError("YouTube refresh token으로 액세스 토큰을 갱신하지 못했습니다.")
     return creds
@@ -128,6 +172,33 @@ def build_video_resource(title: str, description: str) -> Dict[str, Any]:
 
 
 def upload_shorts(
+    video_path: str,
+    title: str,
+    description: str,
+    thumbnail_path: Optional[str] = None,
+    expected_channel_id: Optional[str] = None,
+    youtube: Any = None,
+) -> str:
+    try:
+        return _upload_shorts(
+            video_path,
+            title,
+            description,
+            thumbnail_path=thumbnail_path,
+            expected_channel_id=expected_channel_id,
+            youtube=youtube,
+        )
+    except YouTubeAuthExpired:
+        raise
+    except YouTubeUploadError:
+        raise
+    except Exception as exc:
+        if is_invalid_grant(exc):
+            raise YouTubeAuthExpired(_AUTH_EXPIRED_MESSAGE) from exc
+        raise
+
+
+def _upload_shorts(
     video_path: str,
     title: str,
     description: str,

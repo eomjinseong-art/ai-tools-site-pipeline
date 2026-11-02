@@ -5,12 +5,18 @@ on:
     - cron: "0 23 * * *" # 08:00 KST
   workflow_dispatch:
 
+permissions:
+  contents: write
+  issues: write
+
 jobs:
   promo:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -31,28 +37,61 @@ jobs:
         run: python -m unittest discover -s tests -v
 
       - name: Restore promo state cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
-          path: out/promo_shorts_state.json
-          key: promo-shorts-state
+          path: |
+            out/promo_shorts_state.json
+            out/content_queue_state.json
+          key: promo-shorts-state-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
+            promo-shorts-state-
             promo-shorts-state
+
+      - name: Report script queue days left
+        run: python -m content_queue status --outdir out
 
       - name: Publish daily Short
         env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          OPENAI_MODEL: ${{ secrets.OPENAI_MODEL }}
-          REWRITE_MODEL: ${{ secrets.REWRITE_MODEL }}
-          ELEVENLABS_API_KEY: ${{ secrets.ELEVENLABS_API_KEY }}
-          ELEVEN_VOICE_ID: ${{ secrets.ELEVEN_VOICE_ID }}
+          # Paid LLM/TTS keys are not used.
+          # invalid_grant opens/updates issue "유튜브 로그인 다시 필요".
+          # days_left < 14 opens/updates issue "쇼츠 대본 대기열 부족".
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EDGE_TTS_VOICE: ko-KR-SunHiNeural
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           YT_CLIENT_ID: ${{ secrets.YT_CLIENT_ID }}
           YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
           YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
           EXPECTED_YOUTUBE_CHANNEL_ID: ${{ secrets.EXPECTED_YOUTUBE_CHANNEL_ID }}
-          GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
         run: python promo_pipeline.py --outdir out
+
+      - name: Record consumed script ids
+        if: success()
+        continue-on-error: true
+        run: |
+          if [[ ! -f content_queue/consumed_ids.json ]]; then
+            echo "no consumed state file"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add content_queue/consumed_ids.json
+          if git diff --cached --quiet; then
+            echo "consumed ids unchanged"
+            exit 0
+          fi
+          git commit -m "chore: record consumed shorts script id"
+          git push origin HEAD
+
+      - name: Save promo state cache
+        if: always()
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            out/promo_shorts_state.json
+            out/content_queue_state.json
+          key: promo-shorts-state-${{ github.run_id }}-${{ github.run_attempt }}
 
       - name: Upload generated artifacts
         if: always()
@@ -64,10 +103,14 @@ jobs:
             out/thumbnail.jpg
             out/metadata.json
             out/cards.json
+            out/script.json
+            out/queue_status.json
             out/upload.json
+            out/youtube_auth_error.json
             out/skipped.json
             out/source_video.json
             out/promo_shorts_state.json
+            out/content_queue_state.json
           if-no-files-found: warn
 
       - name: Fail if publish did not complete

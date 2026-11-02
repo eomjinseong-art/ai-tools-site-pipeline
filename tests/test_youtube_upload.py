@@ -2,14 +2,19 @@ import unittest
 
 from google.oauth2.credentials import Credentials
 
+from google.auth.exceptions import RefreshError
+
 from youtube_upload import (
     TOKEN_URI,
+    YouTubeAuthExpired,
     YouTubeUploadError,
     assert_expected_channel,
     build_shorts_description,
     build_shorts_title,
     build_video_resource,
     credentials_from_env,
+    is_invalid_grant,
+    refresh_access_token,
 )
 
 
@@ -53,6 +58,24 @@ class YouTubeHelperTests(unittest.TestCase):
             assert_expected_channel("UC-actual", "UC-expected")
         assert_expected_channel("UC-same", "UC-same")
         assert_expected_channel("UC-actual", "")
+
+    def test_invalid_grant_is_recognized_and_refresh_raises_auth_expired(self):
+        self.assertTrue(is_invalid_grant(RefreshError("invalid_grant: Token has been expired or revoked.")))
+        self.assertTrue(
+            is_invalid_grant(
+                RefreshError({"error": "invalid_grant", "error_description": "Token has been expired or revoked."})
+            )
+        )
+        self.assertFalse(is_invalid_grant(RuntimeError("invalid_client")))
+
+        class _Creds:
+            valid = False
+
+            def refresh(self, _request):
+                raise RefreshError("invalid_grant: Token has been expired or revoked.")
+
+        with self.assertRaises(YouTubeAuthExpired):
+            refresh_access_token(_Creds())
 
     def test_video_resource_is_public_shorts_payload(self):
         body = build_video_resource("제목 #Shorts", "설명 #Shorts")
