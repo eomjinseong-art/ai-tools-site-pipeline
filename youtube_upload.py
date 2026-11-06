@@ -1,11 +1,9 @@
 """
-YouTube Shorts 업로드 (설치된 앱 + refresh token, CI에서 브라우저 없음).
+YouTube title and description helpers.
 
-환경변수:
-  YT_CLIENT_ID
-  YT_CLIENT_SECRET
-  YT_REFRESH_TOKEN
-  EXPECTED_YOUTUBE_CHANNEL_ID  (선택 — 불일치 시 업로드 중단)
+`upload_shorts` and `build_video_resource` are retired. They raise before
+reading credentials or calling the videos.insert API. There is no public
+privacy default and no environment-variable bypass.
 """
 
 from __future__ import annotations
@@ -16,7 +14,8 @@ from typing import Any, Dict, Optional
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload
+
+from legacy_shorts_retirement import refuse_legacy_black_card_shorts
 
 YOUTUBE_UPLOAD_SCOPES = [
     "https://www.googleapis.com/auth/youtube.upload",
@@ -157,18 +156,10 @@ def fetch_my_channel_id(youtube) -> str:
 
 
 def build_video_resource(title: str, description: str) -> Dict[str, Any]:
-    return {
-        "snippet": {
-            "title": title[:TITLE_MAX],
-            "description": description,
-            "tags": ["Shorts", "나두AI", "AI툴", "AI Tools Korea"],
-            "categoryId": "28",
-        },
-        "status": {
-            "privacyStatus": os.environ.get("YT_PRIVACY_STATUS", "public"),
-            "selfDeclaredMadeForKids": False,
-        },
-    }
+    """Retired. Does not build a public video resource."""
+    del title, description
+    refuse_legacy_black_card_shorts("YouTube video resource")
+    raise AssertionError("unreachable")
 
 
 def upload_shorts(
@@ -179,65 +170,7 @@ def upload_shorts(
     expected_channel_id: Optional[str] = None,
     youtube: Any = None,
 ) -> str:
-    try:
-        return _upload_shorts(
-            video_path,
-            title,
-            description,
-            thumbnail_path=thumbnail_path,
-            expected_channel_id=expected_channel_id,
-            youtube=youtube,
-        )
-    except YouTubeAuthExpired:
-        raise
-    except YouTubeUploadError:
-        raise
-    except Exception as exc:
-        if is_invalid_grant(exc):
-            raise YouTubeAuthExpired(_AUTH_EXPIRED_MESSAGE) from exc
-        raise
-
-
-def _upload_shorts(
-    video_path: str,
-    title: str,
-    description: str,
-    thumbnail_path: Optional[str] = None,
-    expected_channel_id: Optional[str] = None,
-    youtube: Any = None,
-) -> str:
-    if not os.path.isfile(video_path):
-        raise YouTubeUploadError(f"업로드할 파일이 없습니다: {video_path}")
-
-    if youtube is None:
-        youtube = build_youtube_client()
-
-    channel_id = fetch_my_channel_id(youtube)
-    expected = expected_channel_id if expected_channel_id is not None else os.environ.get("EXPECTED_YOUTUBE_CHANNEL_ID")
-    assert_expected_channel(channel_id, expected)
-
-    body = build_video_resource(title, description)
-    media = MediaFileUpload(video_path, mimetype="video/mp4", resumable=True, chunksize=1024 * 1024)
-    request = youtube.videos().insert(part="snippet,status", body=body, media_body=media)
-
-    response = None
-    while response is None:
-        status, response = request.next_chunk()
-        if status:
-            print(f"[youtube] upload {int(status.progress() * 100)}%")
-
-    video_id = (response or {}).get("id")
-    if not video_id:
-        raise YouTubeUploadError(f"YouTube 업로드 응답에 id가 없습니다: {response}")
-
-    if thumbnail_path and os.path.isfile(thumbnail_path):
-        try:
-            youtube.thumbnails().set(
-                videoId=video_id,
-                media_body=MediaFileUpload(thumbnail_path, mimetype="image/jpeg"),
-            ).execute()
-        except Exception as exc:
-            print(f"[youtube] 썸네일 설정 실패(영상은 업로드됨): {exc}")
-
-    print(f"[youtube] uploaded https://www.youtube.com/shorts/{video_id} (channel={channel_id})")
-    return video_id
+    """Retired. Does not refresh credentials or call the YouTube insert API."""
+    del video_path, title, description, thumbnail_path, expected_channel_id, youtube
+    refuse_legacy_black_card_shorts("YouTube Shorts upload")
+    raise AssertionError("unreachable")

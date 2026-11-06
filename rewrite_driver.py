@@ -1,8 +1,7 @@
 """
 LOCAL DEBUG ONLY — not the GitHub Actions entrypoint.
 
-Production daily job:
-  python promo_pipeline.py
+Black-card render and YouTube upload are retired. Do not use this driver to publish.
 
 This driver only resolves a script + TTS. It does not render final.mp4 or upload.
 SAMPLE_INPUT is a leftover example and is NOT the production path.
@@ -53,7 +52,7 @@ def main():
     else:
         print(
             "[driver] WARNING: SAMPLE_INPUT 을 사용합니다. "
-            "프로덕션은 promo_pipeline.py + collector DB를 쓰세요. "
+            "렌더와 YouTube 업로드는 중단되었습니다. "
             "로컬 디버그라면 --input JSON을 넘기세요."
         )
         payload = SAMPLE_INPUT
@@ -88,7 +87,7 @@ def main():
             raise SystemExit(f"[driver] TTS 실패: {key}: {exc}") from exc
         print(f"[driver] 생성 완료 ({engine}): {out_path}")
 
-    print("[driver] 완료. 렌더/업로드는 promo_pipeline.py를 사용하세요.")
+    print("[driver] 완료. 검정 카드 렌더와 YouTube 업로드는 호출하지 않습니다.")
 
 
 if __name__ == "__main__":

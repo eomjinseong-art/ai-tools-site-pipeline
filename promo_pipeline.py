@@ -1,20 +1,11 @@
 """
-Daily Shorts pipeline entrypoint.
+Script check for the retired Shorts publisher.
 
-  1. Pick one unpublished-for-shorts video from the collector Supabase DB
-  2. Use a pre-written script, or a deterministic template if that tool has none
-  3. TTS (edge-tts, then gTTS) + render vertical final.mp4
-  4. Upload to YouTube Shorts
-  5. Mark the video and the consumed script id
+Black-card generation and YouTube upload are refused. `--dry-run` still
+resolves a script to JSON and does not render or upload. Any other invocation
+exits 2 before the collector, TTS, render, or upload.
 
-Usage:
-  python promo_pipeline.py
-  python promo_pipeline.py --dry-run
-  python promo_pipeline.py --input fixture.json --skip-upload
-  python promo_pipeline.py --skip-upload   # render only
-
-GitHub Actions must call this file, not rewrite_driver.py.
-No paid LLM or TTS API key is required.
+The beige/pastel 9-card carousel is a separate pipeline and is not this file.
 """
 
 from __future__ import annotations
@@ -29,20 +20,11 @@ from typing import Any, Dict, Optional
 
 from content_queue import (
     build_queue_report,
-    consumed_state_paths,
-    mark_script_consumed,
     resolve_shorts_script,
 )
-from github_issues import open_youtube_reauth_issue, sync_queue_issue
-from rewrite_for_shorts import cards_as_list
+from github_issues import sync_queue_issue
+from legacy_shorts_retirement import RETIREMENT_EXIT_CODE, RETIREMENT_REASON, refuse_legacy_black_card_shorts
 from supabase_source import CollectorVideo, SupabaseSource, row_to_video
-from youtube_upload import (
-    YouTubeAuthExpired,
-    YouTubeUploadError,
-    build_shorts_description,
-    build_shorts_title,
-    upload_shorts,
-)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
@@ -70,13 +52,13 @@ def video_from_input(payload: Dict[str, Any]) -> CollectorVideo:
 
 
 def parse_args(argv: Optional[list] = None) -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Nadoo AI YouTube Shorts daily publisher")
+    p = argparse.ArgumentParser(description="Retired black-card Shorts publisher. Only --dry-run resolves a script.")
     p.add_argument("--outdir", "-o", default="out", help="Output directory")
-    p.add_argument("--input", "-i", help="Optional local JSON instead of Supabase")
-    p.add_argument("--font", help="Optional TTF/TTC path for Korean cards")
-    p.add_argument("--dry-run", action="store_true", help="Rewrite only; no TTS/render/upload")
-    p.add_argument("--skip-upload", action="store_true", help="Render final.mp4 but do not upload")
-    p.add_argument("--skip-rewrite", action="store_true", help="Use source texts as cards (debug)")
+    p.add_argument("--input", "-i", help="Optional local JSON instead of Supabase (dry-run only)")
+    p.add_argument("--font", help="Ignored. Black-card rendering is retired.")
+    p.add_argument("--dry-run", action="store_true", help="Resolve a script to JSON; no TTS, render, or upload")
+    p.add_argument("--skip-upload", action="store_true", help="Retired. Generation is refused together with upload.")
+    p.add_argument("--skip-rewrite", action="store_true", help="Dry-run only: use the deterministic template")
     return p.parse_args(argv)
 
 
@@ -150,12 +132,27 @@ def alert_queue_if_needed(outdir: Path) -> Dict[str, Any]:
 
 
 def render_final(outdir: str, video: CollectorVideo, cards: Dict[str, str], font: Optional[str]) -> Dict[str, Any]:
-    from full_orchestrator import orchestrate
+    del outdir, video, cards, font
+    refuse_legacy_black_card_shorts("Black-card Shorts render")
+    return {}
 
-    metadata = video.to_metadata()
-    metadata["cards"] = cards_as_list(cards)
-    metadata["short_title"] = cards.get("card1_hook") or video.hook
-    return orchestrate(outdir, metadata=metadata, font_path=font, allow_silent_tts=False)
+
+def refuse_publication(outdir: Path) -> int:
+    """Stop before collector reads, render, upload, or script-id consumption."""
+    logging.error("%s", RETIREMENT_REASON)
+    print(RETIREMENT_REASON, file=sys.stderr)
+    try:
+        write_json(
+            outdir / "retired.json",
+            {
+                "retired": True,
+                "exit_code": RETIREMENT_EXIT_CODE,
+                "reason": RETIREMENT_REASON,
+            },
+        )
+    except OSError:
+        logging.exception("could not write retired.json")
+    return RETIREMENT_EXIT_CODE
 
 
 def main(argv: Optional[list] = None) -> int:
@@ -165,6 +162,9 @@ def main(argv: Optional[list] = None) -> int:
 
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
+    if not args.dry_run:
+        return refuse_publication(outdir)
+
     alert_queue_if_needed(outdir)
 
     video = pick_video(args, outdir)
@@ -201,77 +201,7 @@ def main(argv: Optional[list] = None) -> int:
         logging.info("Dry-run complete (no render/upload).")
         return 0
 
-    try:
-        render_meta = render_final(str(outdir), video, cards, args.font)
-    except Exception:
-        logging.exception("Render failed")
-        return 1
-
-    final_path = Path(render_meta.get("final_path") or (outdir / "final.mp4"))
-    if not final_path.is_file():
-        logging.error("final.mp4 was not produced")
-        return 1
-
-    if args.skip_upload:
-        write_json(outdir / "upload.json", {"skipped": True, "reason": "--skip-upload"})
-        logging.info("Render complete; upload skipped.")
-        return 0
-
-    title = build_shorts_title(video.title, hook=cards.get("card1_hook") or video.hook)
-    tool_link = (choice.link or "").strip()
-    extra = f"도구 링크: {tool_link}" if tool_link else None
-    description = build_shorts_description(
-        video.title,
-        cards.get("card5_takeaway") or video.takeaway,
-        video.youtube_id,
-        extra=extra,
-    )
-
-    try:
-        yt_id = upload_shorts(
-            video_path=str(final_path),
-            title=title,
-            description=description,
-            thumbnail_path=render_meta.get("thumbnail"),
-        )
-    except YouTubeAuthExpired:
-        logging.exception("[youtube] invalid_grant")
-        issue: Dict[str, Any] = {"error": "invalid_grant"}
-        try:
-            issue = open_youtube_reauth_issue()
-            logging.error("[youtube] opened or updated issue: %s", issue.get("number") or issue)
-        except Exception:
-            logging.exception("[youtube] failed to open reauth issue")
-        write_json(outdir / "youtube_auth_error.json", {"error": "invalid_grant", "issue": issue})
-        return 1
-    except YouTubeUploadError:
-        logging.exception("YouTube upload failed")
-        return 1
-    except Exception:
-        logging.exception("YouTube upload failed")
-        return 1
-
-    mark = SupabaseSource(state_path=outdir / "promo_shorts_state.json").mark_uploaded(video.id, yt_id)
-    if choice.source == "queue" and choice.script_id:
-        try:
-            mark_script_consumed(choice.script_id, consumed_state_paths(outdir))
-        except Exception:
-            logging.exception("[queue] failed to record consumed script id %s", choice.script_id)
-    write_json(
-        outdir / "upload.json",
-        {
-            "youtube_id": yt_id,
-            "url": f"https://www.youtube.com/shorts/{yt_id}",
-            "title": title,
-            "source_video_id": video.id,
-            "source_youtube_id": video.youtube_id,
-            "script_source": choice.source,
-            "script_id": choice.script_id,
-            "tracking": mark,
-        },
-    )
-    logging.info("Published Shorts %s", yt_id)
-    return 0
+    return refuse_publication(outdir)
 
 
 if __name__ == "__main__":

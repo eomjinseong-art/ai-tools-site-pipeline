@@ -1,50 +1,35 @@
 # Nadoo AI (AI Tools Korea) Shorts pipeline
 
-Daily GitHub Action that picks one collector video, chooses a pre-written Korean Shorts script (or a deterministic template), renders a vertical Short with free TTS, and uploads it to YouTube.
+The legacy black-card YouTube Shorts publisher is retired. It drew generic black/white cards watermarked `나두 AI 요약` and uploaded them as public Shorts. That path now fails closed.
 
-Production entrypoint: `python promo_pipeline.py`  
-`rewrite_driver.py` is local debug only and must not be used in Actions.
+`python promo_pipeline.py` without `--dry-run` exits 2, writes `out/retired.json`, and does not read the collector, render, or upload. No environment variable or privacy flag turns it back on. Reactivation requires an explicit new design permission and a new code change.
 
-Scripts and the days-left formula: [docs/CONTENT_QUEUE.md](docs/CONTENT_QUEUE.md).
+Cause, the paths that could start it again, and the remaining risks: [docs/LEGACY_BLACK_CARD_SHORTS_RETIREMENT.md](docs/LEGACY_BLACK_CARD_SHORTS_RETIREMENT.md).
 
-```bash
-python -m content_queue status
-```
+The beige/pastel 9-card carousel is a separate pipeline. It is not in this repository, and this change does not disable it or restyle it as black cards.
 
-## Required GitHub Secrets
+## What still runs
 
-| Secret | Purpose |
+| Command or workflow | Behavior |
 | --- | --- |
-| `SUPABASE_URL` | Collector DB (`https://xxxx.supabase.co`) |
-| `SUPABASE_SERVICE_ROLE_KEY` | Service role (bypasses RLS; never expose to browsers) |
-| `YT_CLIENT_ID` | YouTube OAuth installed-app client |
-| `YT_CLIENT_SECRET` | YouTube OAuth client secret |
-| `YT_REFRESH_TOKEN` | Long-lived refresh token (no browser in CI) |
+| `python -m content_queue status` | Prints the prewritten script ledger. No video. |
+| `python promo_pipeline.py --dry-run --input tests/fixtures/sample_video.json` | Resolves a script to JSON. No TTS, render, or upload. |
+| `supabase_source.py` helpers | Read and filter collector rows. They do not upload. |
+| `.github/workflows/ci.yml` | Unit tests on pull requests. |
 
-`GITHUB_TOKEN` is provided by Actions. The job needs `issues: write` so it can open **유튜브 로그인 다시 필요** when refresh returns `invalid_grant`, and **쇼츠 대본 대기열 부족** when fewer than 14 days of pre-written scripts remain.
+Script fields and the days-left formula: [docs/CONTENT_QUEUE.md](docs/CONTENT_QUEUE.md).
 
-Optional:
+`.github/workflows/promo_upload.yml` keeps the name `Promo Shorts - Daily Publish` so the existing disabled workflow stays that workflow. It has no schedule. A manual run fails with the retirement reason and does not upload. Do not re-enable it.
 
-| Secret or variable | Purpose |
-| --- | --- |
-| `EXPECTED_YOUTUBE_CHANNEL_ID` | Abort upload if the refresh token is tied to another channel |
-| `EDGE_TTS_VOICE` | Korean neural voice. Default `ko-KR-SunHiNeural`. Alternate `ko-KR-InJoonNeural`. |
+`deploy_to_repo.ps1` no longer copies or pushes the publisher.
 
-TTS is `edge-tts==7.3.1` with retries, then gTTS. No paid TTS or LLM key is read. Remove leftover `OPENAI_API_KEY`, `OPENAI_MODEL`, `REWRITE_MODEL`, `ELEVENLABS_API_KEY`, and `ELEVEN_VOICE_ID` secrets if they are still stored; the workflow does not use them.
+## Secrets
 
-Do not commit token files, client secrets, or `.env`.
+This retirement does not read, print, rotate, or delete YouTube or Supabase secrets. An old checkout can still upload until it runs this code. Do not commit token files, client secrets, or `.env`.
 
 ## One-time Supabase migration
 
-Content comes from the collector project's `videos` table.
-
-The job selects a row where:
-
-- `status = 'published'`
-- `hook`, `summary_points` (≥3), and `takeaway` are filled
-- `promo_short_youtube_id` is null (not yet posted as a promo Short)
-
-Run this once in the Supabase SQL editor (also in `supabase/migration_add_promo_short_columns.sql`):
+Historical promo rows used the collector `videos` table. The retired publisher does not write these columns. The SQL remains for the existing schema:
 
 ```sql
 alter table videos
@@ -58,22 +43,13 @@ create index if not exists idx_videos_promo_short_pending
   where status = 'published' and promo_short_youtube_id is null;
 ```
 
-If the columns are missing, the job falls back to `out/promo_shorts_state.json`. That file does not survive a fresh Actions checkout unless the workflow cache restores it, so the SQL columns are the durable source of truth.
+The same statements are in `supabase/migration_add_promo_short_columns.sql`.
 
-Script ids that were already uploaded are stored in `content_queue/consumed_ids.json` (committed at the end of a successful run) and mirrored to `out/content_queue_state.json`.
-
-## Local commands
+## Local checks
 
 ```bash
 pip install -r requirements.txt
 python -m unittest discover -s tests -v
 python -m content_queue status
-
-# queue or template + render + upload (Supabase and YouTube secrets only)
-python promo_pipeline.py --outdir out
-
-# collector JSON fixture, no network upload
 python promo_pipeline.py --input tests/fixtures/sample_video.json --dry-run
 ```
-
-Schedule stays `0 23 * * *` (08:00 KST). The job fails if render or YouTube upload fails. An `invalid_grant` refresh also fails the run after opening or updating the re-login issue. A short queue does not fail the run; the daily upload uses the template and updates the queue issue.
