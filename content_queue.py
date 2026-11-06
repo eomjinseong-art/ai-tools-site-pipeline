@@ -501,7 +501,7 @@ def low_water_issue_body(report: Dict[str, Any]) -> str:
         f"- 기준: days_left = floor(미사용 유효 대본 수 / cadence_per_day) < {threshold}\n"
         f"- 남은 id: {preview}{extra}\n\n"
         "content_queue/shorts_scripts.json 에 대본을 추가해 주세요.\n"
-        "해당 도구 대본이 없어도 템플릿으로 일일 업로드는 계속됩니다.\n"
+        "레거시 검정 카드 쇼츠 업로드는 중단되었습니다. 템플릿이 있어도 영상을 올리지 않습니다.\n"
         "이 이슈는 잔여 일수가 바뀌면 본문을 갱신합니다.\n"
     )
 

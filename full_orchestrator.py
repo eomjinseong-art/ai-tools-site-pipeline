@@ -1,11 +1,9 @@
 """
-Full orchestrator: cards -> card images -> edge-tts/gTTS -> clips -> final.mp4
+Retired black-card renderer.
 
-Usage:
-  python full_orchestrator.py --outdir out --input metadata.json
-
-Prefer promo_pipeline.py for the daily job. This module only renders.
-Requires: ffmpeg, ffprobe. Python deps: pillow.
+`make_card_image` and `orchestrate` refuse to draw or assemble the legacy
+black/white Shorts (watermark `나두 AI 요약`). Text wrapping helpers stay
+available. This module does not implement the beige/pastel 9-card carousel.
 """
 
 from __future__ import annotations
@@ -20,6 +18,8 @@ import sys
 from typing import Dict, List, Optional
 
 from PIL import Image, ImageDraw, ImageFont
+
+from legacy_shorts_retirement import refuse_legacy_black_card_shorts
 
 try:
     import rewrite_for_shorts
@@ -133,6 +133,7 @@ def wrap_text_for_image(text: str, font, max_width: int, draw: ImageDraw.ImageDr
 
 
 def make_card_image(text: str, outpath: str, width: int = 1080, height: int = 1920, font_path: Optional[str] = None):
+    refuse_legacy_black_card_shorts("Black-card image generation")
     bg_color = (18, 18, 18)
     text_color = (255, 255, 255)
     accent = (255, 90, 90)
@@ -295,6 +296,7 @@ def orchestrate(
     font_path: Optional[str] = None,
     allow_silent_tts: Optional[bool] = None,
 ) -> Dict:
+    refuse_legacy_black_card_shorts("Black-card Shorts render")
     check_command("ffmpeg")
     check_command("ffprobe")
     ensure_dir(outdir)
@@ -410,6 +412,7 @@ def parse_args():
 
 
 def main():
+    refuse_legacy_black_card_shorts("Black-card Shorts render")
     args = parse_args()
     ensure_dir(args.outdir)
     metadata = None

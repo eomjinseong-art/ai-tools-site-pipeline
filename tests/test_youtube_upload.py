@@ -4,6 +4,7 @@ from google.oauth2.credentials import Credentials
 
 from google.auth.exceptions import RefreshError
 
+from legacy_shorts_retirement import LegacyBlackCardShortsRetired
 from youtube_upload import (
     TOKEN_URI,
     YouTubeAuthExpired,
@@ -15,6 +16,7 @@ from youtube_upload import (
     credentials_from_env,
     is_invalid_grant,
     refresh_access_token,
+    upload_shorts,
 )
 
 
@@ -77,12 +79,11 @@ class YouTubeHelperTests(unittest.TestCase):
         with self.assertRaises(YouTubeAuthExpired):
             refresh_access_token(_Creds())
 
-    def test_video_resource_is_public_shorts_payload(self):
-        body = build_video_resource("제목 #Shorts", "설명 #Shorts")
-        self.assertEqual(body["snippet"]["categoryId"], "28")
-        self.assertIn("Shorts", body["snippet"]["tags"])
-        self.assertEqual(body["status"]["privacyStatus"], "public")
-        self.assertFalse(body["status"]["selfDeclaredMadeForKids"])
+    def test_video_resource_and_upload_are_retired(self):
+        with self.assertRaises(LegacyBlackCardShortsRetired):
+            build_video_resource("제목 #Shorts", "설명 #Shorts")
+        with self.assertRaises(LegacyBlackCardShortsRetired):
+            upload_shorts("missing.mp4", "제목", "설명")
 
 
 if __name__ == "__main__":
